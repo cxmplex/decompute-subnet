@@ -38,4 +38,4 @@ https://github.com/cxmplex/decompute-subnet/blob/main/neurons/Miner/container.py
 
 # How to make a secure compute subnet
 
-**10t/hr consulting, dm me**
+**10t/hr**
