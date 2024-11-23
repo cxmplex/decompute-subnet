@@ -30,4 +30,4 @@ Below is how it interacts with the miner, and what we've done to fake it:
 5. Once the validator retrieves the encrypted username, password, and port, it will attempt to test the ssh access of the machine via `check_ssh_login`.
 
 6. `check_ssh_login` uses paramiko to perform a ssh connection to the machine.
-   - This connection passes as our fake ssh server can respond to ssh connection requests
+   - This connection passes as our fake ssh server can respond to ssh connection requests. I opted to use paramiko to create the fake ssh server as it only seems fitting.
