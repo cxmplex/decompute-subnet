@@ -32,6 +32,6 @@ Below is how it interacts with the miner, and what we've done to fake it:
 6. `check_ssh_login` uses paramiko to perform a ssh connection to the machine.
    - This connection passes as our fake ssh server can respond to ssh connection requests. I opted to use paramiko to create the fake ssh server as it only seems fitting.
 
-# Main file to look at for how we fake it
+Proof of concept logic that incorporates these changes:
 
 https://github.com/cxmplex/decompute-subnet/blob/main/neurons/Miner/container.py
