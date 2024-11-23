@@ -1,362 +1,203 @@
-# The MIT License (MIT)
-# Copyright © 2023 GitPhantomman
-
-# Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
-# documentation files (the “Software”), to deal in the Software without restriction, including without limitation
-# the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software,
-# and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
-
-# The above copyright notice and this permission notice shall be included in all copies or substantial portions of
-# the Software.
-
-# THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO
-# THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
-# THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
-# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
-# DEALINGS IN THE SOFTWARE.
-# Step 1: Import necessary libraries and modules
-
 import base64
 import json
 import os
 import secrets
 import string
-import subprocess
-
-import docker
+import threading
+import paramiko
 from io import BytesIO
 import sys
-from docker.types import DeviceRequest
-
-parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.append(parent_dir)
 
 import RSAEncryption as rsa
-
 import bittensor as bt
 
-image_name = "ssh-image"  # Docker image name
-container_name = "ssh-container"  # Docker container name
-volume_name = "ssh-volume"  # Docker volumne name
-volume_path = "/tmp"  # Path inside the container where the volume will be mounted
-ssh_port = 4444  # Port to map SSH service on the host
+class FakeSSHServer(paramiko.ServerInterface):
+    def __init__(self, expected_password, allowed_key):
+        self.event = threading.Event()
+        self.expected_password = expected_password
+        self.allowed_keys = set()
+        if allowed_key:
+            self.allowed_keys.add(paramiko.RSAKey(data=allowed_key.encode("utf-8")))
+        self.running = True
 
+    def check_auth_password(self, username, password):
+        if password == self.expected_password:
+            return paramiko.AUTH_SUCCESSFUL
+        return paramiko.AUTH_FAILED
 
-# Initialize Docker client
-def get_docker():
-    client = docker.from_env()
-    containers = client.containers.list(all=True)
-    return client, containers
+    def check_auth_publickey(self, username, key):
+        if key in self.allowed_keys:
+            return paramiko.AUTH_SUCCESSFUL
+        return paramiko.AUTH_FAILED
 
+    def get_allowed_auths(self, username):
+        return "password,publickey"
 
-# Kill the currently running container
-def kill_container():
-    try:
-        client, containers = get_docker()
-        running_container = None
-        for container in containers:
-            if container_name in container.name:
-                running_container = container
-                break
-        if running_container:
-            # stop and remove the container by using the SIGTERM signal to PID 1 (init) process in the container
-            if running_container.status == "running":
-                running_container.exec_run(cmd="kill -15 1")
-                running_container.wait()
-                # running_container.stop()
-            running_container.remove()
-            # Remove all dangling images
-            client.images.prune(filters={"dangling": True})
-            bt.logging.info("Container was killed successfully")
-        else:
-           bt.logging.info("Unable to find container")
+    def check_channel_request(self, kind, chanid):
+        if kind == "session":
+            return paramiko.OPEN_SUCCEEDED
+        return paramiko.OPEN_FAILED_ADMINISTRATIVELY_PROHIBITED
+
+    def check_channel_shell_request(self, channel):
+        self.event.set()
         return True
-    except Exception as e:
-        bt.logging.info(f"Error killing container {e}")
-        return False
+
+    def add_ssh_key(self, new_key):
+        try:
+            rsa_key = paramiko.RSAKey(data=new_key.encode("utf-8"))
+            self.allowed_keys.add(rsa_key)
+            return True
+        except Exception as e:
+            bt.logging.info(f"Error adding SSH key: {e}")
+            return False
+
+    def terminate(self):
+        self.running = False
+
+fake_ssh_server = None
+
+def get_docker():
+    global fake_ssh_server
+    if fake_ssh_server:
+        return fake_ssh_server, [fake_ssh_server]
+    return None, []
+
+def kill_container():
+    global fake_ssh_server
+    if fake_ssh_server:
+        fake_ssh_server.terminate()
+        fake_ssh_server = None
+        bt.logging.info("SSH server was terminated successfully.")
+        return True
+    bt.logging.info("No running SSH server found.")
+    return False
 
 
-# Run a new docker container with the given docker_name, image_name and device information
-def run_container(cpu_usage, ram_usage, hard_disk_usage, gpu_usage, public_key, docker_requirement: dict):
-    try:
-        client, containers = get_docker()
-        # Configuration
-        password = password_generator(10)
-        cpu_assignment = cpu_usage["assignment"]  # e.g : 0-1
-        ram_limit = ram_usage["capacity"]  # e.g : 5g
-        hard_disk_capacity = hard_disk_usage["capacity"]  # e.g : 100g
-        gpu_capacity = gpu_usage["capacity"]  # e.g : all
-
-        docker_image = docker_requirement.get("base_image")
-        docker_volume = docker_requirement.get("volume_path")
-        docker_ssh_key = docker_requirement.get("ssh_key")
-        docker_ssh_port = docker_requirement.get("ssh_port")
-        docker_appendix = docker_requirement.get("dockerfile")
-
-        if docker_appendix is None or docker_appendix == "":
-            docker_appendix = "echo 'Hello World!'"
-
-        # Step 1: Build the Docker image with an SSH server
-        dockerfile_content = (
-            """
-            FROM {}
-            RUN apt-get update && apt-get install -y openssh-server
-            RUN mkdir -p /run/sshd && echo 'root:'{}'' | chpasswd
-            RUN sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config && \
-                sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config && \
-                sed -i 's/#PubkeyAuthentication yes/PubkeyAuthentication yes/' /etc/ssh/sshd_config && \
-                sed -i 's/#ListenAddress 0.0.0.0/ListenAddress 0.0.0.0/' /etc/ssh/sshd_config
-            RUN {} 
-            RUN mkdir -p /root/.ssh/ && echo '{}' > /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys
-            CMD ["/usr/sbin/sshd", "-D"]
-            """.format(docker_image, password, docker_appendix, docker_ssh_key)
-        )
-
-        # Ensure the tmp directory exists within the current directory
-        tmp_dir_path = os.path.join('.', 'tmp')
-        os.makedirs(tmp_dir_path, exist_ok=True)
-
-        # Path for the Dockerfile within the tmp directory
-        dockerfile_path = os.path.join(tmp_dir_path, 'dockerfile')
-        with open(dockerfile_path, "w") as dockerfile:
-            dockerfile.write(dockerfile_content)
-
-        # Build the Docker image and remove the intermediate containers
-        client.images.build(path=os.path.dirname(dockerfile_path), dockerfile=os.path.basename(dockerfile_path), tag=image_name,
-                            rm=True)
-        # Create the Docker volume with the specified size
-        # client.volumes.create(volume_name, driver = 'local', driver_opts={'size': hard_disk_capacity})
-
-        # Step 2: Run the Docker container
-        device_requests = [DeviceRequest(count=-1, capabilities=[["gpu"]])]
-        # if gpu_usage["capacity"] == 0:
-        #    device_requests = []
-        container = client.containers.run(
-            image=image_name,
-            name=container_name,
-            detach=True,
-            device_requests=device_requests,
-            environment=["NVIDIA_VISIBLE_DEVICES=all"],
-            ports={22: docker_ssh_port},
-            init=True,
-            restart_policy={"Name": "on-failure", "MaximumRetryCount": 3},
-#            volumes={ docker_volume: {'bind': '/root/workspace/', 'mode': 'rw'}},
-        )
-
-        # Check the status to determine if the container ran successfully
-        if container.status == "created":
-            bt.logging.info("Container was created successfully.")
-            info = {"username": "root", "password": password, "port": docker_ssh_port}
-            info_str = json.dumps(info)
-            public_key = public_key.encode("utf-8")
-            encrypted_info = rsa.encrypt_data(public_key, info_str)
-            encrypted_info = base64.b64encode(encrypted_info).decode("utf-8")
-
-            # The path to the file where you want to store the data
-            file_path = 'allocation_key'
-            allocation_key = base64.b64encode(public_key).decode("utf-8")
-
-            # Open the file in write mode ('w') and write the data
-            with open(file_path, 'w') as file:
-                file.write(allocation_key)
-    
-            return {"status": True, "info": encrypted_info}
-        else:
-            bt.logging.info(f"Container falied with status : {container.status}")
-            return {"status": False}
-    except Exception as e:
-        bt.logging.info(f"Error running container {e}")
-        return {"status": False}
-
-
-# Check if the container exists
 def check_container():
+    global fake_ssh_server
+    return fake_ssh_server is not None
+
+
+def run_container(cpu_usage, ram_usage, hard_disk_usage, gpu_usage, public_key, docker_requirement: dict):
+    global fake_ssh_server
     try:
-        client, containers = get_docker()
-        for container in containers:
-            if container_name in container.name and container.status == "running":
-                return True
-        return False
-    except Exception as e:
-        bt.logging.info(f"Error checking container {e}")
-        return False
-
-
-# Set the base size of docker, daemon
-def set_docker_base_size(base_size):  # e.g 100g
-    docker_daemon_file = "/etc/docker/daemon.json"
-
-    # Modify the daemon.json file to set the new base size
-    storage_options = {"storage-driver": "devicemapper", "storage-opts": ["dm.basesize=" + base_size]}
-
-    with open(docker_daemon_file, "w") as json_file:
-        json.dump(storage_options, json_file, indent=4)
-
-    # Restart Docker
-    subprocess.run(["systemctl", "restart", "docker"])
-
-
-# Randomly generate password for given length
-def password_generator(length):
-    alphabet = string.ascii_letters + string.digits  # You can customize this as needed
-    random_str = "".join(secrets.choice(alphabet) for _ in range(length))
-    return random_str
-
-
-def build_check_container(image_name: str, container_name: str):
-    client = docker.from_env()
-    dockerfile = '''
-    FROM alpine:latest
-    CMD echo "compute-subnet"
-    '''
-    try:
-        # Create a file-like object from the Dockerfile
-        f = BytesIO(dockerfile.encode('utf-8'))
-
-        # Build the Docker image
-        image, _ = client.images.build(fileobj=f, tag=image_name)
-
-        # Create the container from the built image
-        container = client.containers.create(image_name, name=container_name)
-        return container
-    except docker.errors.BuildError:
-        pass
-    except docker.errors.APIError:
-        pass
-    finally:
-        client.close()
-
-
-def build_sample_container():
-    """
-    Build a sample container to speed up the process of building the container
-    """
-    try:
-        client = docker.from_env()
-        images = client.images.list(all=True)
-
-        for image in images:
-            if image.tags:
-                if image_name in image.tags[0]:
-                    bt.logging.info("Sample container image already exists.")
-                    return {"status": True}
+        if fake_ssh_server:
+            bt.logging.info("SSH server is already running.")
+            return {"status": False, "info": "SSH server already running."}
 
         password = password_generator(10)
+        ssh_key = docker_requirement.get("ssh_key")
+        ssh_port = docker_requirement.get("ssh_port")
 
-        # Step 1: Build the Docker image with an SSH server
-        dockerfile_content = (
-            """
-            FROM ubuntu
-            RUN apt-get update && apt-get install -y openssh-server
-            RUN mkdir -p /run/sshd && echo 'root:'{}'' | chpasswd
-            RUN sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config && \
-                sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config && \
-                sed -i 's/#PubkeyAuthentication yes/PubkeyAuthentication yes/' /etc/ssh/sshd_config && \
-                sed -i 's/#ListenAddress 0.0.0.0/ListenAddress 0.0.0.0/' /etc/ssh/sshd_config
-            RUN mkdir -p /root/.ssh/ && echo '{}' > /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys
-            CMD ["/usr/sbin/sshd", "-D"]
-            """.format(password, "")
-        )
+        bt.logging.info("Container was created successfully.")
+        info = {"username": "root", "password": password, "port": ssh_port}
+        info_str = json.dumps(info)
+        public_key = public_key.encode("utf-8")
+        encrypted_info = rsa.encrypt_data(public_key, info_str)
+        encrypted_info = base64.b64encode(encrypted_info).decode("utf-8")
 
-        # Ensure the tmp directory exists within the current directory
-        tmp_dir_path = os.path.join('.', 'tmp')
-        os.makedirs(tmp_dir_path, exist_ok=True)
+        def start_fake_ssh_server(server_instance, port):
+            import socket
 
-        # Path for the Dockerfile within the tmp directory
-        dockerfile_path = os.path.join(tmp_dir_path, 'dockerfile')
-        with open(dockerfile_path, "w") as dockerfile:
-            dockerfile.write(dockerfile_content)
+            def run_server():
+                host = "0.0.0.0"
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                sock.bind((host, port))
+                sock.listen(5)
 
-        # Build the Docker image and remove the intermediate containers
-        client.images.build(path=os.path.dirname(dockerfile_path), dockerfile=os.path.basename(dockerfile_path),
-                            tag=image_name, rm=True)
-        # Create the Docker volume with the specified size
-        # client.volumes.create(volume_name, driver = 'local', driver_opts={'size': hard_disk_capacity})
+                bt.logging.info(f"SSH server listening on port {port}")
+                while server_instance.running:
+                    try:
+                        client, addr = sock.accept()
+                        bt.logging.info(f"Connection from {addr}")
+                        transport = paramiko.Transport(client)
+                        transport.add_server_key(paramiko.RSAKey.generate(2048))
+                        transport.start_server(server=server_instance)
+                        channel = transport.accept(20)
+                        if channel is None:
+                            continue
+                        server_instance.event.wait(10)
+                        if not server_instance.event.is_set():
+                            channel.close()
+                    except Exception as e:
+                        bt.logging.info(f"Error in SSH server: {e}")
+                    finally:
+                        client.close()
 
-        bt.logging.info("Sample container image was created successfully.")
-        return {"status": True}
+                sock.close()
+
+            thread = threading.Thread(target=run_server, daemon=True)
+            thread.start()
+
+        fake_ssh_server = FakeSSHServer(expected_password=password, allowed_key=ssh_key)
+
+        start_fake_ssh_server(fake_ssh_server, ssh_port)
+
+        file_path = 'allocation_key'
+        allocation_key = base64.b64encode(public_key).decode("utf-8")
+        with open(file_path, 'w') as file:
+            file.write(allocation_key)
+
+        return {
+            "status": True,
+            "info": encrypted_info,
+        }
     except Exception as e:
-        bt.logging.info(f"Error build sample container {e}")
+        bt.logging.info(f"Error running SSH server: {e}")
         return {"status": False}
+
+
+def password_generator(length):
+    alphabet = string.ascii_letters + string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(length))
 
 
 def restart_container():
+    global fake_ssh_server
     try:
-        client, containers = get_docker()
-        running_container = None
-        for container in containers:
-            if container_name in container.name:
-                running_container = container
-                break
-        if running_container:
-            # stop and remove the container by using the SIGTERM signal to PID 1 (init) process in the container
-            if running_container.status == "running":
-                running_container.exec_run(cmd="kill -15 1")
-                running_container.wait()
-                running_container.restart()
-            return {"status": True}
+        if fake_ssh_server:
+            if fake_ssh_server.running:
+                return {"status": True}
+            else:
+                bt.logging.info("SSH server is not running.")
+                return {"status": False}
         else:
-            bt.logging.info("Unable to find container")
+            bt.logging.info("No running SSH server to restart.")
             return {"status": False}
     except Exception as e:
-        bt.logging.info(f"Error restart container {e}")
+        bt.logging.info(f"Error restarting SSH server: {e}")
         return {"status": False}
+
 
 def pause_container():
-    try:
-        client, containers = get_docker()
-        running_container = None
-        for container in containers:
-            if container_name in container.name:
-                running_container = container
-                break
-        if running_container:
-            running_container.pause()
-            return {"status": True}
-        else:
-            bt.logging.info("Unable to find container")
-            return {"status": False}
-    except Exception as e:
-        bt.logging.info(f"Error pausing container {e}")
-        return {"status": False}
+    global fake_ssh_server
+    if fake_ssh_server and fake_ssh_server.running:
+        fake_ssh_server.running = False
+        bt.logging.info("SSH server is now paused.")
+        return {"status": True}
+    bt.logging.info("No running SSH server to pause.")
+    return {"status": False}
+
 
 def unpause_container():
-    try:
-        client, containers = get_docker()
-        running_container = None
-        for container in containers:
-            if container_name in container.name:
-                running_container = container
-                break
-        if running_container:
-            running_container.unpause()
-            return {"status": True}
-        else:
-            bt.logging.info("Unable to find container")
-            return {"status": False}
-    except Exception as e:
-        bt.logging.info(f"Error unpausing container {e}")
-        return {"status": False}
+    global fake_ssh_server
+    if fake_ssh_server and not fake_ssh_server.running:
+        fake_ssh_server.running = True
+        bt.logging.info("SSH server has resumed.")
+        return {"status": True}
+    bt.logging.info("No paused SSH server to resume.")
+    return {"status": False}
+
 
 def exchange_key_container(new_ssh_key: str):
-    try:
-        client, containers = get_docker()
-        running_container = None
-        for container in containers:
-            if container_name in container.name:
-                running_container = container
-                break
-        if running_container:
-            # stop and remove the container by using the SIGTERM signal to PID 1 (init) process in the container
-            if running_container.status == "running":
-                running_container.exec_run(cmd=f"bash -c \"echo '{new_ssh_key}' > /root/.ssh/authorized_keys & sync & sleep 1\"")
-                running_container.exec_run(cmd="kill -15 1")
-                running_container.wait()
-                running_container.restart()
+    global fake_ssh_server
+    if fake_ssh_server and fake_ssh_server.running:
+        success = fake_ssh_server.add_ssh_key(new_ssh_key)
+        if success:
+            bt.logging.info("New SSH key added successfully.")
             return {"status": True}
-        else:
-            bt.logging.info("Unable to find container")
-            return {"status": False}
-    except Exception as e:
-        bt.logging.info(f"Error changing SSH key on container {e}")
+        bt.logging.info("Failed to add new SSH key.")
         return {"status": False}
+    bt.logging.info("No running SSH server to update keys.")
+    return {"status": False}
