@@ -35,3 +35,7 @@ Below is how it interacts with the miner, and what we've done to fake it:
 Proof of concept logic that incorporates these changes:
 
 https://github.com/cxmplex/decompute-subnet/blob/main/neurons/Miner/container.py
+
+# How to make a secure compute subnet
+
+**10t/hr consulting, dm me**
